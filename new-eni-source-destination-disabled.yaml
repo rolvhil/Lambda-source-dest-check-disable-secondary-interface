@@ -1,0 +1,95 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+#hilvanr
+#template creates cloudwatch event rule that watches for CreateNetworkInterface and subnetid on CloudTrail. 
+#Lambda function that modifies the source/destination check to false based on the ENI ID of the created interface.
+#Cloudwatch event as trigger to lambda
+
+
+
+Parameters:
+  LambdaRole:  #use policy AWSLambdaBasicExecutionRole and a custom policy that allows ec2:ModifyNetworkInterfaceAttribute and ec2:DescribeNetworkInterfaces
+    Type: String
+    Default: 'arn:aws:iam::111111111111:role/LambdaBasicExecutionRole'
+    Description: Role arn to attach to lambda
+  
+  Subnetidfilter:
+    Type: "List<AWS::EC2::Subnet::Id>"
+    Description: Subnetid filter to trigger lambda
+
+Resources:
+  LambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.DEBUG)
+
+          def lambda_handler(event, context):
+              try:
+                  # Log the event first
+                  logger.debug("event: " + json.dumps(event))
+                  # Extract the networkInterfaceId from the event
+                  network_interface_id = event['detail']['responseElements']['networkInterface']['networkInterfaceId']
+                  ec2 = boto3.client('ec2')
+                  logger.debug("network_interface_id: " + network_interface_id)
+                  response = ec2.modify_network_interface_attribute(
+                    NetworkInterfaceId=network_interface_id,
+                    SourceDestCheck={
+                       'Value': False
+                    }
+                  )
+                  logger.debug("modify_network_interface_attribute response: " + json.dumps(response))
+                  # Get the network interface details
+                  network_interface = ec2.describe_network_interfaces(NetworkInterfaceIds=[network_interface_id])['NetworkInterfaces'][0]
+                  source_dest_check = network_interface['SourceDestCheck']
+                  logger.debug("source_dest_check: " + str(source_dest_check))
+                  return {
+                    'statusCode': 200,
+                    'body': json.dumps(network_interface_id)
+                  }
+              except Exception as e:
+                  logger.error("An error occurred: " + str(e))
+                  return {
+                    'statusCode': 500,
+                    'body': json.dumps("An error occurred: " + str(e))
+                  }
+ 
+      Handler: 'index.lambda_handler'
+      Role: !Ref LambdaRole
+      Runtime: python3.8
+      Timeout: '30'
+
+  CloudWatchEventRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      EventPattern:
+        source:
+          - 'aws.ec2'
+        detail-type:
+          - 'AWS API Call via CloudTrail'
+        detail:
+          eventSource:
+          - ec2.amazonaws.com
+          eventName:
+          - CreateNetworkInterface
+          requestParameters:
+            subnetId: !Ref Subnetidfilter
+      State: ENABLED
+      Targets:
+        - Id: '1'
+          Arn: !GetAtt LambdaFunction.Arn
+
+
+  MyLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref LambdaFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt CloudWatchEventRule.Arn
